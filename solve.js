@@ -16,8 +16,13 @@ const RESERVED = ['posts', 'tags', 'page'];
 const byCodeUnits = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 
 /** Bulk HTML escape: one native replace over the whole run. */
+const ESC_RE = /[&<>"']/g;
+function escChar(c) {
+  return ESC[c];
+}
 function escapeHtml(text) {
-  return text.replace(/[&<>"']/g, (c) => ESC[c]);
+  if (text.indexOf('&') === -1 && text.indexOf('<') === -1 && text.indexOf('>') === -1 && text.indexOf('"') === -1 && text.indexOf("'") === -1) return text;
+  return text.replace(ESC_RE, escChar);
 }
 
 /** A YYYY-MM-DD date in words, from the string alone. */
@@ -134,19 +139,22 @@ function valueOf(key, raw) {
 }
 
 function parseFrontMatter(text) {
-  const lines = text.split('\n');
-  if (lines[0] !== '---') return { error: 'no front matter' };
-  let close = -1;
-  for (let i = 1; i < lines.length; i++) {
-    if (lines[i] === '---') { close = i; break; }
-  }
-  if (close === -1) return { error: 'the front matter is not closed' };
+  // The body is the text after the closing '---' line: take it as a
+  // substring instead of splitting the whole source and joining it back.
+  if (text !== '---' && !text.startsWith('---\n')) return { error: 'no front matter' };
+  let closeStart = text.indexOf('\n---\n', 3);
+  let bodyStart;
+  if (closeStart !== -1) bodyStart = closeStart + 5;
+  else if (text.endsWith('\n---')) { closeStart = text.length - 4; bodyStart = text.length; }
+  else return { error: 'the front matter is not closed' };
+  const fmText = text.slice(4, closeStart);
+  const lines = fmText === '' ? [] : fmText.split('\n');
   const data = {};
-  for (let i = 1; i < close; i++) {
-    const line = lines[i];
+  for (let k = 0; k < lines.length; k++) {
+    const line = lines[k];
     if (isBlank(line) || line.startsWith('#')) continue;
     const m = FM_LINE.exec(line);
-    if (!m) return { error: `line ${i + 1} is not "key: value"` };
+    if (!m) return { error: `line ${k + 2} is not "key: value"` };
     const key = m[1];
     const raw = (m[2] ?? '').replace(/[ \t]+$/, '');
     if (!FM_KEYS.includes(key)) return { error: `unknown key "${key}"` };
@@ -157,7 +165,7 @@ function parseFrontMatter(text) {
     data[key] = v.value;
   }
   if (!Object.hasOwn(data, 'title')) return { error: 'no title' };
-  return { data, body: lines.slice(close + 1).join('\n') };
+  return { data, body: text.slice(bodyStart) };
 }
 
 // ---------------------------------------------------------------- markdown
@@ -170,31 +178,42 @@ function trimLine(line) {
   return a === 0 && b === line.length ? line : line.slice(a, b);
 }
 
-/** First index >= from where s holds `what` outside a backslash escape, or -1. */
+/** First index >= from where s holds `what` outside a backslash escape, or -1.
+ *  A run of backslashes pairs off, so `what` is escaped exactly when the
+ *  run of backslashes just before it is odd (its first char is escapable). */
 function findUnescaped(s, what, from) {
-  for (let j = from; j <= s.length - what.length; j++) {
-    if (s[j] === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) { j++; continue; }
-    if (s.startsWith(what, j)) return j;
+  let j = s.indexOf(what, from);
+  while (j !== -1) {
+    let b = 0;
+    for (let k = j - 1; k >= from && s[k] === '\\'; k--) b++;
+    if (b % 2 === 0) return j;
+    j = s.indexOf(what, j + 1);
   }
   return -1;
 }
 
 /** First single * from `from` (one whose run is not **), outside an escape, or -1. */
 function findSingleStar(s, from) {
-  for (let j = from; j < s.length; j++) {
-    const c = s[j];
-    if (c === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) { j++; continue; }
-    if (c !== '*') continue;
-    if (s[j + 1] === '*') { j++; continue; }
+  let j = s.indexOf('*', from);
+  while (j !== -1) {
+    let b = 0;
+    for (let k = j - 1; k >= from && s[k] === '\\'; k--) b++;
+    if (b % 2 === 1) { j = s.indexOf('*', j + 1); continue; }
+    if (s[j + 1] === '*') { j = s.indexOf('*', j + 2); continue; }
     return j;
   }
   return -1;
 }
 
+/** Any char inline() must act on. Shared, but lastIndex is set before
+ *  every exec, so the recursive calls below cannot corrupt the scan. */
+const SPECIAL = /[\\`*\[&<>"']/g;
+
 /**
- * `s` rendered inline, in one pass: plain runs are escaped in bulk instead
- * of one escape call per character. Strong / emphasis / link inner text is
- * rendered by the same function, exactly as the reference does.
+ * `s` rendered inline, in one pass: the scan jumps from one special char
+ * to the next with a native regex instead of walking every character,
+ * and plain runs are escaped in bulk. Strong / emphasis / link inner text
+ * is rendered by the same function, exactly as the reference does.
  */
 function inline(s, env) {
   const out = [];
@@ -206,68 +225,77 @@ function inline(s, env) {
     hasEsc = false;
   };
   while (i < s.length) {
-    const c = s[i];
-    if (c === '\\' && i + 1 < s.length && ESCAPABLE.has(s[i + 1])) {
-      flush(i);
-      out.push(ESC[s[i + 1]] ?? s[i + 1]);
-      i += 2;
+    SPECIAL.lastIndex = i;
+    const m = SPECIAL.exec(s);
+    if (m === null) {
+      // No special char at all (first scan from 0): nothing to render
+      // or escape, so return the string itself instead of copying it.
+      if (i === 0) return s;
+      break;
+    }
+    const j = m.index;
+    const c = s[j];
+    if (c === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) {
+      flush(j);
+      out.push(ESC[s[j + 1]] ?? s[j + 1]);
+      i = j + 2;
       plain = i;
       continue;
     }
     if (c === '`') {
-      const j = s.indexOf('`', i + 1);
-      if (j > i + 1) {
-        flush(i);
-        out.push('<code>', escapeHtml(s.slice(i + 1, j)), '</code>');
-        i = j + 1;
+      const k = s.indexOf('`', j + 1);
+      if (k > j + 1) {
+        flush(j);
+        out.push('<code>', escapeHtml(s.slice(j + 1, k)), '</code>');
+        i = k + 1;
         plain = i;
-      } else i++;
+      } else i = j + 1;
       continue;
     }
     if (c === '*') {
-      if (s[i + 1] === '*') {
-        const j = findUnescaped(s, '**', i + 2);
-        if (j > i + 2) {
-          flush(i);
-          out.push('<strong>', inline(s.slice(i + 2, j), env), '</strong>');
-          i = j + 2;
+      if (s[j + 1] === '*') {
+        const k = findUnescaped(s, '**', j + 2);
+        if (k > j + 2) {
+          flush(j);
+          out.push('<strong>', inline(s.slice(j + 2, k), env), '</strong>');
+          i = k + 2;
           plain = i;
-        } else i += 2;
+        } else i = j + 2;
         continue;
       }
-      const j = findSingleStar(s, i + 1);
-      if (j > i + 1) {
-        flush(i);
-        out.push('<em>', inline(s.slice(i + 1, j), env), '</em>');
-        i = j + 1;
+      const k = findSingleStar(s, j + 1);
+      if (k > j + 1) {
+        flush(j);
+        out.push('<em>', inline(s.slice(j + 1, k), env), '</em>');
+        i = k + 1;
         plain = i;
-      } else i++;
+      } else i = j + 1;
       continue;
     }
     if (c === '[') {
-      const k = findUnescaped(s, ']', i + 1);
-      const m = k !== -1 && s[k + 1] === '(' ? s.indexOf(')', k + 2) : -1;
-      const target = m === -1 ? '' : s.slice(k + 2, m);
+      const k = findUnescaped(s, ']', j + 1);
+      const n = k !== -1 && s[k + 1] === '(' ? s.indexOf(')', k + 2) : -1;
+      const target = n === -1 ? '' : s.slice(k + 2, n);
       if (target !== '' && !/\s/.test(target)) {
-        flush(i);
-        out.push('<a href="', escapeHtml(env.link(target)), '">', inline(s.slice(i + 1, k), env), '</a>');
-        i = m + 1;
+        flush(j);
+        out.push('<a href="', escapeHtml(env.link(target)), '">', inline(s.slice(j + 1, k), env), '</a>');
+        i = n + 1;
         plain = i;
         continue;
       }
-      i++;
+      i = j + 1;
       continue;
     }
-    if (c === '&' || c === '<' || c === '>' || c === '"' || c === "'") hasEsc = true;
-    i++;
+    // & < > " ' : part of the plain run, escaped by flush in bulk
+    hasEsc = true;
+    i = j + 1;
   }
   flush(s.length);
   return out.join('');
 }
 
 function isBlank(line) {
-  for (let i = 0; i < line.length; i++) if (line[i] !== ' ' && line[i] !== '\t') return false;
-  return true;
+  return line === '' || !/[^\t ]/.test(line);
 }
 
 /** Fence opener: returns its language, or null. */
@@ -344,8 +372,7 @@ function renderMarkdown(src, env) {
       while (i < lines.length && !isFenceClose(lines[i])) body.push(lines[i++]);
       i++;
       const cls = lang === '' ? '' : ` class="language-${escapeHtml(lang)}"`;
-      let code = '';
-      for (let k = 0; k < body.length; k++) code += `${escapeHtml(body[k])}\n`;
+      const code = body.length === 0 ? '' : `${body.map(escapeHtml).join('\n')}\n`;
       blocks.push(`<pre><code${cls}>${code}</code></pre>`);
       continue;
     }
@@ -409,8 +436,7 @@ function renderMarkdown(src, env) {
     if (excerpt === null) excerpt = html;
     blocks.push(`<p>${html}</p>`);
   }
-  let html = '';
-  for (const b of blocks) html += `${b}\n`;
+  const html = blocks.length === 0 ? '' : `${blocks.join('\n')}\n`;
   return { html, toc, excerpt: excerpt ?? '' };
 }
 
@@ -529,18 +555,76 @@ function truthy(v) {
   return v !== undefined && v !== null && v !== false && v !== '' && v !== 0;
 }
 
+/**
+ * Compile a parsed template to a function (scope, ctx, depth, out) that
+ * renders it straight, with no per-node dispatch. The generated code
+ * calls the same helpers (lookup/textOf/truthy/escapeHtml) with the same
+ * arguments as the interpreter below, so its output is identical by
+ * construction; every literal comes from JSON.stringify, so template
+ * text can never break out of the generated code. If compilation ever
+ * fails, the template falls back to the interpreter.
+ */
+function compileTemplate(nodes) {
+  let uid = 0;
+  const nextId = () => ++uid;
+  function gen(list, scopeVar) {
+    let code = '';
+    for (const n of list) {
+      switch (n.kind) {
+        case 'text':
+          code += `out.push(${JSON.stringify(n.text)});`;
+          break;
+        case 'var': {
+          const v = `__v${nextId()}`;
+          code += `let ${v}=lookup(${scopeVar},${JSON.stringify(n.path)});out.push(escapeHtml(typeof ${v}==="string"?${v}:textOf(${v})));`;
+          break;
+        }
+        case 'raw': {
+          const v = `__v${nextId()}`;
+          code += `let ${v}=lookup(${scopeVar},${JSON.stringify(n.path)});out.push(typeof ${v}==="string"?${v}:textOf(${v}));`;
+          break;
+        }
+        case 'if':
+          code += `if(truthy(lookup(${scopeVar},${JSON.stringify(n.path)}))!==${n.not}){${gen(n.then, scopeVar)}}`;
+          if (n.else !== null) code += `else{${gen(n.else, scopeVar)}}`;
+          break;
+        case 'for': {
+          const xs = `__xs${nextId()}`;
+          const k = `__k${nextId()}`;
+          const ns = `__s${nextId()}`;
+          code += `let ${xs}=lookup(${scopeVar},${JSON.stringify(n.path)});if(Array.isArray(${xs})){for(let ${k}=0;${k}<${xs}.length;${k}++){const ${ns}={vars:{[${JSON.stringify(n.name)}]:${xs}[${k}],loop:{index:${k}+1,first:${k}===0,last:${k}===${xs}.length-1,length:${xs}.length}},parent:${scopeVar}};${gen(n.body, ns)}}}`;
+          break;
+        }
+        case 'include':
+          code += `{const __t=ctx.templates.get(${JSON.stringify(n.name)});if(__t!==undefined&&depth<${INCLUDE_DEPTH})__t(${scopeVar},ctx,depth+1,out,lookup,textOf,truthy,escapeHtml);}`;
+          break;
+      }
+    }
+    return code;
+  }
+  try {
+    return new Function('scope', 'ctx', 'depth', 'out', 'lookup', 'textOf', 'truthy', 'escapeHtml', gen(nodes, 'scope'));
+  } catch {
+    return (scope, ctx, depth, out) => renderNodes(nodes, scope, ctx, depth, out);
+  }
+}
+
 function renderNodes(nodes, scope, ctx, depth, out) {
   for (const n of nodes) {
     switch (n.kind) {
       case 'text':
         out.push(n.text);
         break;
-      case 'var':
-        out.push(escapeHtml(textOf(lookup(scope, n.path))));
+      case 'var': {
+        const v = lookup(scope, n.path);
+        out.push(escapeHtml(typeof v === 'string' ? v : textOf(v)));
         break;
-      case 'raw':
-        out.push(textOf(lookup(scope, n.path)));
+      }
+      case 'raw': {
+        const v = lookup(scope, n.path);
+        out.push(typeof v === 'string' ? v : textOf(v));
         break;
+      }
       case 'if': {
         const v = truthy(lookup(scope, n.path));
         const branch = v !== n.not ? n.then : n.else;
@@ -558,7 +642,7 @@ function renderNodes(nodes, scope, ctx, depth, out) {
       }
       case 'include': {
         const t = ctx.templates.get(n.name);
-        if (t !== undefined && depth < INCLUDE_DEPTH) renderNodes(t, scope, ctx, depth + 1, out);
+        if (t !== undefined && depth < INCLUDE_DEPTH) t(scope, ctx, depth + 1, out, lookup, textOf, truthy, escapeHtml);
         break;
       }
     }
@@ -568,8 +652,9 @@ function renderNodes(nodes, scope, ctx, depth, out) {
 // ---------------------------------------------------------------- build
 
 function wordsOf(text) {
-  // runs of non-whitespace, counted without building an array of words.
-  // JS \s whitespace code points, as numbers (no regex per character).
+  // Runs of non-whitespace, counted without building an array of words.
+  // The whitespace set is exactly JS \s: 9-13, 32, A0, 1680, 2000-200A,
+  // 2028, 2029, 202F, 205F, 3000, FEFF. (Measured faster than /\S+/g.)
   let n = 0;
   let inWord = false;
   for (let i = 0; i < text.length; i++) {
@@ -603,7 +688,7 @@ export function run(input) {
   const report = [];
   for (const name of Object.keys(input.templates).sort(byCodeUnits)) {
     try {
-      templates.set(name, parseTemplate(name, input.templates[name]));
+      templates.set(name, compileTemplate(parseTemplate(name, input.templates[name])));
     } catch (err) {
       if (!(err instanceof TemplateError)) throw err;
       report.push(err.message);
@@ -615,7 +700,7 @@ export function run(input) {
   let sources = [];
   const statics = [];
   for (const f of files) {
-    if (f.path.endsWith('.md')) sources.push({ path: f.path, text: f.content.replace(/\r\n?/g, '\n') });
+    if (f.path.endsWith('.md')) sources.push({ path: f.path, text: f.content.includes('\r') ? f.content.replace(/\r\n?/g, '\n') : f.content });
     else statics.push({ path: f.path, content: f.content });
   }
 
@@ -736,10 +821,10 @@ export function run(input) {
   const recent = posts.slice(0, input.site.recent).map((p) => cards.get(p));
   const ctx = { templates, escape: escapeHtml };
   const render = (name, vars) => {
-    const nodes = templates.get(name);
-    if (nodes === undefined) return null;
+    const fn = templates.get(name);
+    if (fn === undefined) return null;
     const out = [];
-    renderNodes(nodes, { vars: { site, tags: allTags, recent, ...vars }, parent: null }, ctx, 0, out);
+    fn({ vars: { site, tags: allTags, recent, ...vars }, parent: null }, ctx, 0, out, lookup, textOf, truthy, escapeHtml);
     return out.join('');
   };
   for (const s of sources) {
